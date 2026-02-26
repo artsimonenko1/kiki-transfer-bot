@@ -1,6 +1,4 @@
 
-
-```python
 """
 🚗 Kiki Transfer Bot — полная версия
 Bangkok ↔ Pattaya Transfer Service
@@ -1594,4 +1592,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-```
