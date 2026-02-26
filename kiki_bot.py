@@ -1,3 +1,6 @@
+
+
+```python
 """
 🚗 Kiki Transfer Bot — полная версия
 Bangkok ↔ Pattaya Transfer Service
@@ -7,7 +10,7 @@ import asyncio
 import logging
 import os
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery,
@@ -31,7 +34,7 @@ ADMIN_NAMES = {
     # Например: 197940339: "Артём"
 }
 
-MANAGER_USERNAME = os.environ.get("MANAGER_USERNAME", "")  # @username для связи
+MANAGER_USERNAME = os.environ.get("MANAGER_USERNAME", "")
 # ──────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
@@ -105,6 +108,7 @@ def init_db():
             full_name TEXT,
             order_id INTEGER,
             text TEXT,
+            direction TEXT DEFAULT 'client_to_admin',
             created_at TEXT
         )
     """)
@@ -157,6 +161,16 @@ def save_order(data):
         conn.commit()
     return order_id
 
+def save_message(user_id, username, full_name, order_id, text, direction='client_to_admin'):
+    now = datetime.now().isoformat()
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO messages (user_id, username, full_name, order_id, text, direction, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, username, full_name, order_id, text, direction, now))
+        conn.commit()
+
 def get_order(order_id):
     with db() as conn:
         conn.row_factory = sqlite3.Row
@@ -184,8 +198,8 @@ def get_stats():
     with db() as conn:
         c = conn.cursor()
         today = date.today().isoformat()
-        week_ago = datetime.now().replace(day=datetime.now().day - 7).isoformat()[:10]
-        month_ago = datetime.now().replace(day=1).isoformat()[:10]
+        week_ago = (date.today() - timedelta(days=7)).isoformat()
+        month_ago = date.today().replace(day=1).isoformat()
 
         c.execute("SELECT COUNT(DISTINCT user_id) FROM stats WHERE event='start' AND created_at LIKE ?", (f"{today}%",))
         starts_today = c.fetchone()[0]
@@ -205,7 +219,7 @@ def get_stats():
         c.execute("SELECT COUNT(*) FROM orders WHERE created_at >= ?", (month_ago,))
         orders_month = c.fetchone()[0]
 
-        c.execute("SELECT COUNT(*) FROM orders WHERE status='booked'")
+        c.execute("SELECT COUNT(*) FROM orders WHERE status IN ('booked','driver_sent','done')")
         orders_confirmed = c.fetchone()[0]
 
         c.execute("SELECT COUNT(*) FROM orders WHERE status='pending'")
@@ -213,6 +227,9 @@ def get_stats():
 
         c.execute("SELECT COUNT(*) FROM orders WHERE status='rejected'")
         orders_rejected = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM orders WHERE status='done'")
+        orders_done = c.fetchone()[0]
 
         c.execute("SELECT COUNT(*) FROM orders WHERE direction LIKE '%Бангкок%Паттайя%'")
         bkk_count = c.fetchone()[0]
@@ -223,19 +240,36 @@ def get_stats():
         c.execute("SELECT COUNT(DISTINCT user_id) FROM users")
         total_users = c.fetchone()[0]
 
+        c.execute("SELECT COUNT(*) FROM orders")
+        total_orders = c.fetchone()[0]
+
+        # Статистика за последние 7 дней по дням
+        daily_stats = []
+        for i in range(6, -1, -1):
+            d = (date.today() - timedelta(days=i)).isoformat()
+            c.execute("SELECT COUNT(DISTINCT user_id) FROM stats WHERE event='start' AND created_at LIKE ?", (f"{d}%",))
+            day_starts = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM orders WHERE created_at LIKE ?", (f"{d}%",))
+            day_orders = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM orders WHERE status='done' AND updated_at LIKE ?", (f"{d}%",))
+            day_done = c.fetchone()[0]
+            daily_stats.append({'date': d, 'starts': day_starts, 'orders': day_orders, 'done': day_done})
+
     return {
         'starts_today': starts_today, 'starts_week': starts_week, 'starts_month': starts_month,
         'orders_today': orders_today, 'orders_week': orders_week, 'orders_month': orders_month,
         'orders_confirmed': orders_confirmed, 'orders_pending': orders_pending,
-        'orders_rejected': orders_rejected, 'bkk_count': bkk_count, 'ptt_count': ptt_count,
-        'total_users': total_users
+        'orders_rejected': orders_rejected, 'orders_done': orders_done,
+        'bkk_count': bkk_count, 'ptt_count': ptt_count,
+        'total_users': total_users, 'total_orders': total_orders,
+        'daily_stats': daily_stats
     }
 
 def get_active_orders():
     with db() as conn:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        c.execute("SELECT * FROM orders WHERE status IN ('pending','booked','awaiting_driver') ORDER BY created_at DESC LIMIT 20")
+        c.execute("SELECT * FROM orders WHERE status IN ('pending','booked','driver_sent') ORDER BY created_at DESC LIMIT 20")
         return c.fetchall()
 
 def get_completed_orders():
@@ -275,8 +309,8 @@ class BKK(StatesGroup):
     date       = State()
     time       = State()
     hotel      = State()
-    board_name = State()
     phone      = State()
+    board_name = State()
     confirm    = State()
 
 class PTT(StatesGroup):
@@ -298,6 +332,9 @@ class DriverInfo(StatesGroup):
     driver_phone = State()
 
 class ClientMessage(StatesGroup):
+    waiting = State()
+
+class AdminReply(StatesGroup):
     waiting = State()
 
 
@@ -338,10 +375,11 @@ def kb_cars(prefix="car"):
 
 def kb_passengers(max_seats, prefix="pax"):
     nums = list(range(1, min(max_seats, 10) + 1))
-    rows = [
-        [InlineKeyboardButton(text=str(n), callback_data=f"{prefix}_{n}") for n in nums[:5]],
-    ]
-    if len(nums) > 5:
+    rows = []
+    if len(nums) <= 5:
+        rows.append([InlineKeyboardButton(text=str(n), callback_data=f"{prefix}_{n}") for n in nums])
+    else:
+        rows.append([InlineKeyboardButton(text=str(n), callback_data=f"{prefix}_{n}") for n in nums[:5]])
         rows.append([InlineKeyboardButton(text=str(n), callback_data=f"{prefix}_{n}") for n in nums[5:]])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_car")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -349,26 +387,30 @@ def kb_passengers(max_seats, prefix="pax"):
 def kb_children():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="👤 Без детей", callback_data="children_0"),
-            InlineKeyboardButton(text="1 ребёнок",    callback_data="children_1"),
+            InlineKeyboardButton(text="👤 Нет, только взрослые", callback_data="children_0"),
         ],
         [
-            InlineKeyboardButton(text="2 детей",      callback_data="children_2"),
-            InlineKeyboardButton(text="3 детей",      callback_data="children_3"),
+            InlineKeyboardButton(text="1 ребёнок", callback_data="children_1"),
+            InlineKeyboardButton(text="2 детей",   callback_data="children_2"),
+            InlineKeyboardButton(text="3 детей",   callback_data="children_3"),
         ],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_pax")],
     ])
 
 def kb_bags_large(max_n):
     btns = [InlineKeyboardButton(text=str(i), callback_data=f"blarge_{i}") for i in range(0, min(max_n+1, 11))]
-    rows = [btns[:6], btns[6:]] if len(btns) > 6 else [btns]
+    rows = [btns[:6]]
+    if len(btns) > 6:
+        rows.append(btns[6:])
     rows = [r for r in rows if r]
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_children")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_bags_carry(max_n):
     btns = [InlineKeyboardButton(text=str(i), callback_data=f"bcarry_{i}") for i in range(0, min(max_n+1, 11))]
-    rows = [btns[:6], btns[6:]] if len(btns) > 6 else [btns]
+    rows = [btns[:6]]
+    if len(btns) > 6:
+        rows.append(btns[6:])
     rows = [r for r in rows if r]
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_bags_large")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -384,15 +426,16 @@ def kb_confirm():
 def kb_admin_order(order_id, direction):
     rows = [
         [
-            InlineKeyboardButton(text="✅ Подтвердить",  callback_data=f"booked_{order_id}"),
-            InlineKeyboardButton(text="❌ Отказать",     callback_data=f"reject_{order_id}"),
+            InlineKeyboardButton(text="✅ Подтвердить",  callback_data=f"adm_book_{order_id}"),
+            InlineKeyboardButton(text="❌ Отказать",     callback_data=f"adm_reject_{order_id}"),
         ],
-        [InlineKeyboardButton(text="💬 Написать клиенту", callback_data=f"msg_client_{order_id}")],
+        [InlineKeyboardButton(text="💬 Написать клиенту", callback_data=f"adm_msg_{order_id}")],
     ]
-    if "Паттайя → Бангкок" in direction:
+    if "Паттайя" in direction and "Бангкок" in direction:
         rows.insert(1, [InlineKeyboardButton(
-            text="🚗 Отправить данные водителя", callback_data=f"send_driver_{order_id}"
+            text="🚗 Отправить данные водителя", callback_data=f"adm_driver_{order_id}"
         )])
+    rows.append([InlineKeyboardButton(text="✔️ Завершить заявку", callback_data=f"adm_done_{order_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_admin_panel():
@@ -410,7 +453,10 @@ def order_summary(data, is_bkk=True):
     car = CARS.get(data.get('car_type', 'sedan'), CARS['sedan'])
     children_txt = f"\n👶 Детей: {data.get('children', 0)}" if data.get('children', 0) else ""
     flight_txt = f"\n✈️ Рейс: {data.get('flight', '—')}" if is_bkk else ""
-    board_txt = f"\n🪧 Табличка: {data.get('name_on_board', '—')}" if is_bkk else f"\n🏢 Здание/Комната: {data.get('name_on_board', '—')}"
+    if is_bkk:
+        board_txt = f"\n🪧 Табличка: {data.get('name_on_board', '—')}"
+    else:
+        board_txt = f"\n🏢 Здание/Комната: {data.get('name_on_board', '—')}"
 
     return (
         f"🗺 {data['direction']}\n"
@@ -423,6 +469,29 @@ def order_summary(data, is_bkk=True):
         f"\n📍 Адрес: {data['destination']}"
         f"{board_txt}"
         f"\n📱 Телефон: {data['phone']}"
+    )
+
+def order_summary_from_row(o):
+    car = CARS.get(o['car_type'], {})
+    is_bkk = "Бангкок" in (o['direction'] or '') and (o['direction'] or '').startswith("✈️")
+    children_txt = f"\n👶 Детей: {o['children']}" if o['children'] else ""
+    flight_txt = f"\n✈️ Рейс: {o['flight']}" if is_bkk and o['flight'] and o['flight'] != '—' else ""
+    if is_bkk:
+        board_txt = f"\n🪧 Табличка: {o['name_on_board']}"
+    else:
+        board_txt = f"\n🏢 Здание/Комната: {o['name_on_board']}"
+
+    return (
+        f"🗺 {o['direction']}\n"
+        f"{car.get('emoji','🚗')} {car.get('name',o['car_type'])} — {o['car_price']} ฿\n"
+        f"👥 Взрослых: {o['passengers']}{children_txt}\n"
+        f"🧳 Чемоданов: {o['bags_large']} | 🎒 Ручная кладь: {o['bags_carry']}\n"
+        f"{flight_txt}"
+        f"\n📅 Дата: {o['travel_date']}"
+        f"\n🕐 Время: {o['travel_time']}"
+        f"\n📍 Адрес: {o['destination']}"
+        f"{board_txt}"
+        f"\n📱 Телефон: {o['phone']}"
     )
 
 
@@ -497,7 +566,15 @@ async def prices(cb: CallbackQuery):
         "✅ Платные дороги включены\n"
         "✅ Оплата водителю при посадке\n"
         "✅ Бронирование без предоплаты",
-        reply_markup=kb_back_main(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✈️ Бангкок → Паттайя", callback_data="dir_bkk"),
+            ],
+            [
+                InlineKeyboardButton(text="🏖 Паттайя → Бангкок", callback_data="dir_ptt"),
+            ],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
+        ]),
         parse_mode="HTML"
     )
     await cb.answer()
@@ -508,6 +585,7 @@ async def prices(cb: CallbackQuery):
 # ──────────────────────────────────────────
 @dp.callback_query(F.data == "dir_bkk")
 async def dir_bkk(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
     await state.update_data(direction="✈️ Бангкок → Паттайя", is_bkk=True)
     track_event(cb.from_user.id, "chose_direction_bkk")
     await cb.message.edit_text(
@@ -521,6 +599,7 @@ async def dir_bkk(cb: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "dir_ptt")
 async def dir_ptt(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
     await state.update_data(direction="🏖 Паттайя → Бангкок", is_bkk=False)
     track_event(cb.from_user.id, "chose_direction_ptt")
     await cb.message.edit_text(
@@ -556,7 +635,6 @@ async def bkk_car(cb: CallbackQuery, state: FSMContext):
 async def ptt_car(cb: CallbackQuery, state: FSMContext):
     await handle_car_selection(cb, state, cb.data.split("_", 1)[1], PTT.passengers)
 
-# НАЗАД к выбору авто
 @dp.callback_query(F.data == "back_to_car")
 async def back_to_car(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -703,7 +781,7 @@ async def ptt_bags_carry(cb: CallbackQuery, state: FSMContext):
 
 
 # ──────────────────────────────────────────
-#  БКК: РЕЙС → ДАТА → ВРЕМЯ → ОТЕЛЬ → ТАБЛИЧКА → ТЕЛЕФОН
+#  БКК: РЕЙС → ДАТА → ВРЕМЯ → ОТЕЛЬ → ТЕЛЕФОН → ТАБЛИЧКА
 # ──────────────────────────────────────────
 @dp.message(BKK.flight)
 async def bkk_flight(msg: Message, state: FSMContext):
@@ -729,7 +807,7 @@ async def bkk_time(msg: Message, state: FSMContext):
     await state.update_data(travel_time=msg.text.strip())
     await msg.answer(
         "🏨 Введите <b>название отеля или кондо</b> в Паттайе:\n"
-        "<i>Можно добавить название улицы или прикрепить ссылку на карту</i>",
+        "<i>Можно добавить название или прикрепить ссылку</i>",
         parse_mode="HTML"
     )
     await state.set_state(BKK.hotel)
@@ -740,7 +818,7 @@ async def bkk_hotel(msg: Message, state: FSMContext):
     await msg.answer(
         "📱 Введите ваш <b>номер телефона</b>:\n"
         "<i>Российский: +7 999 123 45 67\n"
-        "Тайский: +66 89 123 4567</i>",
+        "или тайский: +66 89 123 4567</i>",
         parse_mode="HTML"
     )
     await state.set_state(BKK.phone)
@@ -749,7 +827,7 @@ async def bkk_hotel(msg: Message, state: FSMContext):
 async def bkk_phone(msg: Message, state: FSMContext):
     await state.update_data(phone=msg.text.strip())
     await msg.answer(
-        "🪧 Как написать на <b>встречной табличке</b>?\n"
+        "🪧 Какое <b>имя написать на табличке</b> для встречи?\n"
         "<i>Например: Ivan Petrov</i>",
         parse_mode="HTML"
     )
@@ -785,8 +863,8 @@ async def ptt_date(msg: Message, state: FSMContext):
 async def ptt_time(msg: Message, state: FSMContext):
     await state.update_data(travel_time=msg.text.strip())
     await msg.answer(
-        "📍 Введите <b>адрес подачи</b> (отель или кондо в Паттайе):\n"
-        "<i>Можно добавить название улицы или ссылку на карту</i>",
+        "📍 Введите <b>название отеля или кондо</b> в Паттайе:\n"
+        "<i>Можно добавить название или прикрепить ссылку</i>",
         parse_mode="HTML"
     )
     await state.set_state(PTT.pickup)
@@ -795,7 +873,7 @@ async def ptt_time(msg: Message, state: FSMContext):
 async def ptt_pickup(msg: Message, state: FSMContext):
     await state.update_data(destination=msg.text.strip())
     await msg.answer(
-        "🏢 Укажите <b>название здания и номер комнаты/апартамента</b>:\n"
+        "🏢 Укажите <b>название здания (билдинг) и номер комнаты</b>:\n"
         "<i>Например: Building A, Room 512</i>",
         parse_mode="HTML"
     )
@@ -807,7 +885,7 @@ async def ptt_room(msg: Message, state: FSMContext):
     await msg.answer(
         "📱 Введите ваш <b>номер телефона</b>:\n"
         "<i>Российский: +7 999 123 45 67\n"
-        "Тайский: +66 89 123 4567</i>",
+        "или тайский: +66 89 123 4567</i>",
         parse_mode="HTML"
     )
     await state.set_state(PTT.phone)
@@ -880,9 +958,12 @@ async def send_order(cb: CallbackQuery, state: FSMContext):
 # ──────────────────────────────────────────
 #  ДЕЙСТВИЯ АДМИНИСТРАТОРА
 # ──────────────────────────────────────────
-@dp.callback_query(F.data.startswith("booked_"))
+@dp.callback_query(F.data.startswith("adm_book_"))
 async def admin_booked(cb: CallbackQuery):
-    order_id = int(cb.data.split("_")[1])
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    order_id = int(cb.data.split("_")[2])
     order = get_order(order_id)
     if not order:
         await cb.answer("Заявка не найдена", show_alert=True)
@@ -891,12 +972,16 @@ async def admin_booked(cb: CallbackQuery):
     admin_name = ADMIN_NAMES.get(cb.from_user.id, cb.from_user.first_name)
     update_order_status(order_id, "booked", cb.from_user.id)
 
-    is_bkk = "Бангкок" in order['direction'] and "Паттайя" in order['direction'] and order['direction'].startswith("✈️")
+    is_bkk = "Бангкок" in order['direction'] and order['direction'].startswith("✈️")
+
+    car = CARS.get(order['car_type'], {})
+    car_info = f"{car.get('emoji','🚗')} {car.get('name', '')} — {order['car_price']} ฿"
 
     if is_bkk:
         client_text = (
             f"✅ <b>Ваш трансфер #{order_id} забронирован!</b>\n\n"
             f"🗺 {order['direction']}\n"
+            f"{car_info}\n"
             f"📅 {order['travel_date']} в {order['travel_time']}\n\n"
             f"🪧 Водитель встретит вас с табличкой <b>{order['name_on_board']}</b> "
             f"в зоне прилёта после получения багажа.\n\n"
@@ -910,6 +995,7 @@ async def admin_booked(cb: CallbackQuery):
         client_text = (
             f"✅ <b>Ваш трансфер #{order_id} забронирован!</b>\n\n"
             f"🗺 {order['direction']}\n"
+            f"{car_info}\n"
             f"📅 {order['travel_date']} в {order['travel_time']}\n\n"
             f"🚗 Машина забронирована. Скоро мы пришлём вам фото автомобиля, "
             f"имя и номер телефона водителя.\n\n"
@@ -926,7 +1012,6 @@ async def admin_booked(cb: CallbackQuery):
 
     await cb.message.edit_reply_markup(reply_markup=None)
 
-    # Для Паттайя→БКК показываем кнопку отправки водителя
     if not is_bkk:
         await cb.message.reply(
             f"✅ Заявка #{order_id} подтверждена ({admin_name}). Клиент уведомлён.\n\n"
@@ -934,18 +1019,33 @@ async def admin_booked(cb: CallbackQuery):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
                     text="🚗 Отправить данные водителя",
-                    callback_data=f"send_driver_{order_id}"
-                )]
+                    callback_data=f"adm_driver_{order_id}"
+                )],
+                [InlineKeyboardButton(
+                    text="✔️ Завершить заявку",
+                    callback_data=f"adm_done_{order_id}"
+                )],
             ])
         )
     else:
-        await cb.message.reply(f"✅ Заявка #{order_id} подтверждена ({admin_name}). Клиент уведомлён.")
+        await cb.message.reply(
+            f"✅ Заявка #{order_id} подтверждена ({admin_name}). Клиент уведомлён.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="✔️ Завершить заявку",
+                    callback_data=f"adm_done_{order_id}"
+                )],
+            ])
+        )
     await cb.answer("Клиент получил подтверждение!")
 
 
-@dp.callback_query(F.data.startswith("reject_"))
+@dp.callback_query(F.data.startswith("adm_reject_"))
 async def admin_reject(cb: CallbackQuery):
-    order_id = int(cb.data.split("_")[1])
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    order_id = int(cb.data.split("_")[2])
     order = get_order(order_id)
     if not order:
         await cb.answer("Заявка не найдена", show_alert=True)
@@ -962,7 +1062,8 @@ async def admin_reject(cb: CallbackQuery):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="💬 Написать менеджеру", callback_data="contact_manager")],
                 [InlineKeyboardButton(text="🔄 Новый заказ", callback_data="back_main")],
-            ])
+            ]),
+            parse_mode="HTML"
         )
     except Exception as e:
         logger.error(f"Ошибка отправки клиенту: {e}")
@@ -972,15 +1073,35 @@ async def admin_reject(cb: CallbackQuery):
     await cb.answer()
 
 
+@dp.callback_query(F.data.startswith("adm_done_"))
+async def admin_mark_done(cb: CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    order_id = int(cb.data.split("_")[2])
+    order = get_order(order_id)
+    if not order:
+        await cb.answer("Заявка не найдена", show_alert=True)
+        return
+
+    admin_name = ADMIN_NAMES.get(cb.from_user.id, cb.from_user.first_name)
+    update_order_status(order_id, "done", cb.from_user.id)
+
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.message.reply(f"✔️ Заявка #{order_id} завершена ({admin_name}).")
+    await cb.answer("Заявка завершена!")
+
+
 # ──────────────────────────────────────────
 #  ОТПРАВКА ДАННЫХ ВОДИТЕЛЯ (Паттайя → БКК)
 # ──────────────────────────────────────────
-driver_sessions = {}  # admin_id -> order_id
-
-@dp.callback_query(F.data.startswith("send_driver_"))
+@dp.callback_query(F.data.startswith("adm_driver_"))
 async def send_driver_start(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа", show_alert=True)
+        return
     order_id = int(cb.data.split("_")[2])
-    driver_sessions[cb.from_user.id] = order_id
+    await state.update_data(driver_order_id=order_id)
     await cb.message.reply(
         f"📸 Отправьте <b>фото автомобиля</b> для заявки #{order_id}:",
         parse_mode="HTML"
@@ -994,16 +1115,20 @@ async def driver_photo(msg: Message, state: FSMContext):
     await msg.answer("✍️ Введите <b>имя водителя</b>:", parse_mode="HTML")
     await state.set_state(DriverInfo.driver_name)
 
+@dp.message(DriverInfo.photo)
+async def driver_photo_text(msg: Message, state: FSMContext):
+    await msg.answer("📸 Пожалуйста, отправьте именно <b>фото</b> автомобиля.", parse_mode="HTML")
+
 @dp.message(DriverInfo.driver_name)
-async def driver_name(msg: Message, state: FSMContext):
-    await state.update_data(driver_name=msg.text.strip())
+async def driver_name_handler(msg: Message, state: FSMContext):
+    await state.update_data(driver_name_val=msg.text.strip())
     await msg.answer("📱 Введите <b>номер телефона водителя</b>:", parse_mode="HTML")
     await state.set_state(DriverInfo.driver_phone)
 
 @dp.message(DriverInfo.driver_phone)
 async def driver_phone_handler(msg: Message, state: FSMContext):
     data = await state.get_data()
-    order_id = driver_sessions.get(msg.from_user.id)
+    order_id = data.get('driver_order_id')
     order = get_order(order_id)
 
     if not order:
@@ -1011,21 +1136,26 @@ async def driver_phone_handler(msg: Message, state: FSMContext):
         await state.clear()
         return
 
-    driver_name_val = data['driver_name']
+    driver_name_val = data['driver_name_val']
     driver_phone_val = msg.text.strip()
     photo_id = data.get('driver_photo_id')
 
     update_order_driver(order_id, driver_name_val, driver_phone_val)
     update_order_status(order_id, "driver_sent", msg.from_user.id)
 
+    car = CARS.get(order['car_type'], {})
+    car_info = f"{car.get('emoji','🚗')} {car.get('name', '')} — {order['car_price']} ฿"
+
     caption = (
         f"🚗 <b>Данные вашего водителя (заявка #{order_id}):</b>\n\n"
         f"👤 Имя: <b>{driver_name_val}</b>\n"
         f"📱 Телефон: <b>{driver_phone_val}</b>\n\n"
+        f"{car_info}\n"
         f"📅 {order['travel_date']} в {order['travel_time']}\n"
         f"📍 {order['destination']}\n\n"
         f"💵 Оплата водителю при посадке.\n"
         f"🛣 Платные дороги включены.\n\n"
+        f"🚭 Просьба не курить и не употреблять алкоголь в машине.\n\n"
         f"Хорошей дороги! 🙏"
     )
 
@@ -1039,7 +1169,6 @@ async def driver_phone_handler(msg: Message, state: FSMContext):
         await msg.answer(f"❌ Ошибка: {e}")
 
     await state.clear()
-    driver_sessions.pop(msg.from_user.id, None)
 
 
 # ──────────────────────────────────────────
@@ -1047,6 +1176,7 @@ async def driver_phone_handler(msg: Message, state: FSMContext):
 # ──────────────────────────────────────────
 @dp.callback_query(F.data == "contact_manager")
 async def contact_manager(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
     await cb.message.edit_text(
         "💬 <b>Написать менеджеру</b>\n\n"
         "Напишите ваш вопрос и мы ответим в ближайшее время:",
@@ -1063,9 +1193,11 @@ async def client_message_received(msg: Message, state: FSMContext):
     user = msg.from_user
     username = f"@{user.username}" if user.username else "нет username"
 
-    # Ищем последнюю заявку пользователя
     orders_list = get_user_orders(user.id)
     order_ref = f"Заявка #{orders_list[0]['id']}" if orders_list else "Без заявки"
+    order_id = orders_list[0]['id'] if orders_list else None
+
+    save_message(user.id, user.username or "", user.full_name, order_id, msg.text, 'client_to_admin')
 
     admin_text = (
         f"💬 <b>Сообщение от клиента</b>\n\n"
@@ -1083,7 +1215,7 @@ async def client_message_received(msg: Message, state: FSMContext):
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(
                         text="↩️ Ответить клиенту",
-                        callback_data=f"msg_client_{user.id}"
+                        callback_data=f"adm_msg_{user.id}"
                     )]
                 ]),
                 parse_mode="HTML"
@@ -1095,7 +1227,10 @@ async def client_message_received(msg: Message, state: FSMContext):
     if sent:
         await msg.answer(
             "✅ Сообщение отправлено менеджеру!\nМы ответим вам в ближайшее время.",
-            reply_markup=kb_main()
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💬 Написать ещё", callback_data="contact_manager")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
+            ])
         )
     else:
         await msg.answer("❌ Не удалось отправить сообщение. Попробуйте позже.")
@@ -1106,40 +1241,61 @@ async def client_message_received(msg: Message, state: FSMContext):
 # ──────────────────────────────────────────
 #  ОТВЕТ КЛИЕНТУ ОТ АДМИНИСТРАТОРА
 # ──────────────────────────────────────────
-admin_reply_to = {}  # admin_id -> client_user_id
-
-@dp.callback_query(F.data.startswith("msg_client_"))
+@dp.callback_query(F.data.startswith("adm_msg_"))
 async def admin_msg_client(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа", show_alert=True)
+        return
     target_id = int(cb.data.split("_")[2])
-    admin_reply_to[cb.from_user.id] = target_id
+    await state.update_data(reply_target_id=target_id)
     await cb.message.reply(
-        f"✍️ Напишите ответ клиенту (ID: {target_id}).\n"
-        "Следующее ваше сообщение будет отправлено ему."
+        f"✍️ Напишите ответ клиенту (ID: <code>{target_id}</code>).\n"
+        "Следующее ваше сообщение будет отправлено ему.\n\n"
+        "Отменить: /cancel",
+        parse_mode="HTML"
     )
+    await state.set_state(AdminReply.waiting)
     await cb.answer()
 
-@dp.message(F.from_user.id.in_(set(ADMIN_IDS)))
-async def admin_reply_handler(msg: Message, state: FSMContext):
-    # Проверяем — вдруг это ответ клиенту
-    if msg.from_user.id in admin_reply_to:
-        target_id = admin_reply_to.pop(msg.from_user.id)
-        admin_name = ADMIN_NAMES.get(msg.from_user.id, "Менеджер")
-        try:
-            await bot.send_message(
-                target_id,
-                f"💬 <b>Ответ менеджера:</b>\n\n{msg.text}",
-                parse_mode="HTML"
-            )
-            await msg.answer("✅ Ответ отправлен клиенту!")
-        except Exception as e:
-            await msg.answer(f"❌ Не удалось отправить: {e}")
+@dp.message(AdminReply.waiting)
+async def admin_reply_send(msg: Message, state: FSMContext):
+    if msg.text and msg.text.strip() == "/cancel":
+        await state.clear()
+        await msg.answer("Отменено.")
+        return
+
+    data = await state.get_data()
+    target_id = data.get('reply_target_id')
+    if not target_id:
+        await state.clear()
+        return
+
+    admin_name = ADMIN_NAMES.get(msg.from_user.id, "Менеджер")
+    try:
+        await bot.send_message(
+            target_id,
+            f"💬 <b>Ответ от менеджера:</b>\n\n{msg.text}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💬 Ответить", callback_data="contact_manager")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
+            ])
+        )
+        save_message(msg.from_user.id, msg.from_user.username or "", msg.from_user.full_name,
+                     None, msg.text, 'admin_to_client')
+        await msg.answer("✅ Ответ отправлен клиенту!")
+    except Exception as e:
+        await msg.answer(f"❌ Не удалось отправить: {e}")
+
+    await state.clear()
 
 
 # ──────────────────────────────────────────
 #  КОМАНДЫ ПОЛЬЗОВАТЕЛЯ
 # ──────────────────────────────────────────
 @dp.message(Command("mystatus"))
-async def my_status(msg: Message):
+async def my_status(msg: Message, state: FSMContext):
+    await state.clear()
     orders_list = get_user_orders(msg.from_user.id)
     if not orders_list:
         await msg.answer(
@@ -1168,20 +1324,38 @@ async def my_status(msg: Message):
             f"Статус: {status}\n\n"
         )
 
-    await msg.answer(text, reply_markup=kb_back_main(), parse_mode="HTML")
+    await msg.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Написать менеджеру", callback_data="contact_manager")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
+    ]), parse_mode="HTML")
+
+
+@dp.message(Command("manager"))
+async def cmd_manager(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer(
+        "💬 <b>Написать менеджеру</b>\n\n"
+        "Напишите ваш вопрос и мы ответим в ближайшее время:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")]
+        ]),
+        parse_mode="HTML"
+    )
+    await state.set_state(ClientMessage.waiting)
 
 
 # ──────────────────────────────────────────
 #  АДМИН-ПАНЕЛЬ
 # ──────────────────────────────────────────
 @dp.message(Command("admin"))
-async def admin_panel(msg: Message):
+async def admin_panel(msg: Message, state: FSMContext):
     if msg.from_user.id not in ADMIN_IDS:
-        await msg.answer("u26d4ufe0f u0423 u0432u0430u0441 u043du0435u0442 u0434u043eu0441u0442u0443u043fu0430 u043a u044du0442u043eu0439 u043au043eu043cu0430u043du0434u0435.")
+        await msg.answer("⛔️ У вас нет доступа к этой команде.")
         return
+    await state.clear()
     await msg.answer(
-        "ud83dudd27 <b>u0410u0434u043cu0438u043d-u043fu0430u043du0435u043bu044c Kiki Transfer</b>\n\n"
-        f"u0414u043eu0431u0440u043e u043fu043eu0436u0430u043bu043eu0432u0430u0442u044c, {msg.from_user.first_name}!",
+        "🔧 <b>Админ-панель Kiki Transfer</b>\n\n"
+        f"Добро пожаловать, {msg.from_user.first_name}!",
         reply_markup=kb_admin_panel(),
         parse_mode="HTML"
     )
@@ -1189,11 +1363,17 @@ async def admin_panel(msg: Message):
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(cb: CallbackQuery):
     if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа", show_alert=True)
         return
     s = get_stats()
+
+    daily_text = ""
+    for d in s['daily_stats']:
+        daily_text += f"  {d['date']}: 👁 {d['starts']} | 📋 {d['orders']} | ✔️ {d['done']}\n"
+
     text = (
         "📊 <b>Статистика Kiki Transfer</b>\n\n"
-        "👥 <b>Посещения (/start):</b>\n"
+        "👥 <b>Посещения (открытия /start):</b>\n"
         f"  Сегодня: {s['starts_today']}\n"
         f"  За неделю: {s['starts_week']}\n"
         f"  За месяц: {s['starts_month']}\n"
@@ -1201,14 +1381,19 @@ async def admin_stats(cb: CallbackQuery):
         "📋 <b>Заявки:</b>\n"
         f"  Сегодня: {s['orders_today']}\n"
         f"  За неделю: {s['orders_week']}\n"
-        f"  За месяц: {s['orders_month']}\n\n"
+        f"  За месяц: {s['orders_month']}\n"
+        f"  Всего заявок: {s['total_orders']}\n\n"
         "📌 <b>По статусам:</b>\n"
         f"  ⏳ Ожидают: {s['orders_pending']}\n"
-        f"  ✅ Подтверждены: {s['orders_confirmed']}\n"
+        f"  ✅ Подтверждены/в работе: {s['orders_confirmed']}\n"
+        f"  ✔️ Выполнено: {s['orders_done']}\n"
         f"  ❌ Отклонены: {s['orders_rejected']}\n\n"
         "🗺 <b>По направлениям:</b>\n"
         f"  ✈️ БКК → Паттайя: {s['bkk_count']}\n"
-        f"  🏖 Паттайя → БКК: {s['ptt_count']}\n"
+        f"  🏖 Паттайя → БКК: {s['ptt_count']}\n\n"
+        "📅 <b>По дням (7 дней):</b>\n"
+        f"  (👁 открытий | 📋 заявок | ✔️ выполнено)\n"
+        f"{daily_text}"
     )
     await cb.message.edit_text(
         text,
@@ -1222,6 +1407,7 @@ async def admin_stats(cb: CallbackQuery):
 @dp.callback_query(F.data == "admin_active")
 async def admin_active(cb: CallbackQuery):
     if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа", show_alert=True)
         return
     orders_list = get_active_orders()
     if not orders_list:
@@ -1231,10 +1417,11 @@ async def admin_active(cb: CallbackQuery):
     status_map = {
         'pending':      '⏳ Ожидает',
         'booked':       '✅ Подтверждена',
-        'awaiting_driver': '🚗 Ждёт водителя',
+        'driver_sent':  '🚗 Водитель назначен',
     }
 
     text = "📋 <b>Активные заявки:</b>\n\n"
+    btns = []
     for o in orders_list:
         car = CARS.get(o['car_type'], {})
         status = status_map.get(o['status'], o['status'])
@@ -1248,12 +1435,56 @@ async def admin_active(cb: CallbackQuery):
             f"📍 {o['destination']}\n"
             f"👮 Принял: {booked_by}\n\n"
         )
+        btns.append([InlineKeyboardButton(
+            text=f"📝 Заявка #{o['id']}", callback_data=f"adm_view_{o['id']}"
+        )])
+
+    btns.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
 
     await cb.message.edit_text(
         text[:4000],
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
-        ]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=btns),
+        parse_mode="HTML"
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("adm_view_"))
+async def admin_view_order(cb: CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    order_id = int(cb.data.split("_")[2])
+    order = get_order(order_id)
+    if not order:
+        await cb.answer("Заявка не найдена", show_alert=True)
+        return
+
+    status_map = {
+        'pending':      '⏳ Ожидает',
+        'booked':       '✅ Подтверждена',
+        'driver_sent':  '🚗 Водитель назначен',
+        'done':         '✔️ Выполнена',
+        'rejected':     '❌ Отклонена',
+    }
+
+    booked_by = ADMIN_NAMES.get(order['booked_by'], f"ID {order['booked_by']}") if order['booked_by'] else "—"
+    username = f"@{order['username']}" if order['username'] else "нет username"
+
+    text = (
+        f"📋 <b>Заявка #{order_id}</b>\n"
+        f"Статус: {status_map.get(order['status'], order['status'])}\n"
+        f"👮 Принял: {booked_by}\n\n"
+        f"👤 {order['full_name']} ({username})\n"
+        f"🆔 <code>{order['user_id']}</code>\n\n"
+        f"{order_summary_from_row(order)}"
+    )
+
+    if order['driver_name']:
+        text += f"\n\n🚗 Водитель: {order['driver_name']} | 📱 {order['driver_phone']}"
+
+    await cb.message.edit_text(
+        text,
+        reply_markup=kb_admin_order(order_id, order['direction']),
         parse_mode="HTML"
     )
     await cb.answer()
@@ -1261,6 +1492,7 @@ async def admin_active(cb: CallbackQuery):
 @dp.callback_query(F.data == "admin_done")
 async def admin_done(cb: CallbackQuery):
     if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа", show_alert=True)
         return
     orders_list = get_completed_orders()
     if not orders_list:
@@ -1271,7 +1503,7 @@ async def admin_done(cb: CallbackQuery):
     for o in orders_list:
         car = CARS.get(o['car_type'], {})
         booked_by = ADMIN_NAMES.get(o['booked_by'], f"ID {o['booked_by']}") if o['booked_by'] else "—"
-        status_emoji = "✅" if o['status'] != 'rejected' else "❌"
+        status_emoji = "✔️" if o['status'] == 'done' else "❌"
         text += (
             f"{status_emoji} <b>#{o['id']}</b>\n"
             f"👤 {o['full_name']}\n"
@@ -1292,6 +1524,9 @@ async def admin_done(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_back")
 async def admin_back(cb: CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа", show_alert=True)
+        return
     await cb.message.edit_text(
         "🔧 <b>Админ-панель Kiki Transfer</b>",
         reply_markup=kb_admin_panel(),
@@ -1301,21 +1536,34 @@ async def admin_back(cb: CallbackQuery):
 
 
 # ──────────────────────────────────────────
+#  КОМАНДА /cancel
+# ──────────────────────────────────────────
+@dp.message(Command("cancel"))
+async def cmd_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer(
+        "Действие отменено.\n\n🚗 <b>Kiki Transfer</b>",
+        reply_markup=kb_main(),
+        parse_mode="HTML"
+    )
+
+
+# ──────────────────────────────────────────
 #  КОМАНДЫ БОТА
 # ──────────────────────────────────────────
 async def set_bot_commands():
-    # Команды для обычных пользователей (без /admin)
     await bot.set_my_commands([
         BotCommand(command="start",    description="🚗 Заказать трансфер"),
-        BotCommand(command="mystatus", description="📋 Статус моей заявки"),
+        BotCommand(command="mystatus", description="📋 Моя заявка / статус"),
+        BotCommand(command="manager",  description="💬 Написать менеджеру"),
     ])
-    # Команды для администраторов (включая /admin)
     from aiogram.types import BotCommandScopeChat
     for admin_id in ADMIN_IDS:
         try:
             await bot.set_my_commands([
                 BotCommand(command="start",    description="🚗 Заказать трансфер"),
-                BotCommand(command="mystatus", description="📋 Статус заявки"),
+                BotCommand(command="mystatus", description="📋 Моя заявка / статус"),
+                BotCommand(command="manager",  description="💬 Написать менеджеру"),
                 BotCommand(command="admin",    description="🔧 Админ-панель"),
             ], scope=BotCommandScopeChat(chat_id=admin_id))
         except Exception as e:
@@ -1346,3 +1594,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+```
