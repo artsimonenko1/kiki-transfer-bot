@@ -18,13 +18,17 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # ──────────────────────────────────────────
 #  НАСТРОЙКИ
 # ──────────────────────────────────────────
-TOKEN    = "8685757419:AAEnrWRQbKcB0SStwgdN_JsCUoXEdCGIPcI"   # ← вставь свой токен
-ADMIN_ID = 123456789          # ← вставь свой Telegram ID (число)
+import os
+TOKEN    = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "123456789"))
 # ──────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 bot = Bot(token=TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
+
+logger.info(f"🚀 Бот запущен. ADMIN_ID={ADMIN_ID}, TOKEN starts={TOKEN[:10]}")
 
 orders: dict = {}
 order_counter = 0
@@ -387,12 +391,17 @@ async def send_order(cb: CallbackQuery, state: FSMContext):
         f"{details}"
     )
 
-    await bot.send_message(
-        ADMIN_ID,
-        admin_text,
-        reply_markup=kb_admin(oid),
-        parse_mode="HTML"
-    )
+    logger.info(f"📨 Отправляю заявку #{oid} на ADMIN_ID={ADMIN_ID} (тип: {type(ADMIN_ID)})")
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            admin_text,
+            reply_markup=kb_admin(oid),
+            parse_mode="HTML"
+        )
+        logger.info(f"✅ Заявка #{oid} отправлена успешно")
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки заявки: {e}")
     await state.clear()
     await cb.answer("Заявка отправлена!")
 
