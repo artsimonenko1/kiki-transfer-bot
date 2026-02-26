@@ -925,7 +925,21 @@ async def admin_booked(cb: CallbackQuery):
         logger.error(f"Ошибка отправки клиенту: {e}")
 
     await cb.message.edit_reply_markup(reply_markup=None)
-    await cb.message.reply(f"✅ Заявка #{order_id} подтверждена ({admin_name}). Клиент уведомлён.")
+
+    # Для Паттайя→БКК показываем кнопку отправки водителя
+    if not is_bkk:
+        await cb.message.reply(
+            f"✅ Заявка #{order_id} подтверждена ({admin_name}). Клиент уведомлён.\n\n"
+            f"Когда назначите водителя — нажмите кнопку ниже:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="🚗 Отправить данные водителя",
+                    callback_data=f"send_driver_{order_id}"
+                )]
+            ])
+        )
+    else:
+        await cb.message.reply(f"✅ Заявка #{order_id} подтверждена ({admin_name}). Клиент уведомлён.")
     await cb.answer("Клиент получил подтверждение!")
 
 
@@ -1163,9 +1177,11 @@ async def my_status(msg: Message):
 @dp.message(Command("admin"))
 async def admin_panel(msg: Message):
     if msg.from_user.id not in ADMIN_IDS:
+        await msg.answer("u26d4ufe0f u0423 u0432u0430u0441 u043du0435u0442 u0434u043eu0441u0442u0443u043fu0430 u043a u044du0442u043eu0439 u043au043eu043cu0430u043du0434u0435.")
         return
     await msg.answer(
-        "🔧 <b>Админ-панель Kiki Transfer</b>",
+        "ud83dudd27 <b>u0410u0434u043cu0438u043d-u043fu0430u043du0435u043bu044c Kiki Transfer</b>\n\n"
+        f"u0414u043eu0431u0440u043e u043fu043eu0436u0430u043bu043eu0432u0430u0442u044c, {msg.from_user.first_name}!",
         reply_markup=kb_admin_panel(),
         parse_mode="HTML"
     )
@@ -1288,11 +1304,22 @@ async def admin_back(cb: CallbackQuery):
 #  КОМАНДЫ БОТА
 # ──────────────────────────────────────────
 async def set_bot_commands():
+    # Команды для обычных пользователей (без /admin)
     await bot.set_my_commands([
         BotCommand(command="start",    description="🚗 Заказать трансфер"),
         BotCommand(command="mystatus", description="📋 Статус моей заявки"),
-        BotCommand(command="admin",    description="🔧 Панель администратора"),
     ])
+    # Команды для администраторов (включая /admin)
+    from aiogram.types import BotCommandScopeChat
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.set_my_commands([
+                BotCommand(command="start",    description="🚗 Заказать трансфер"),
+                BotCommand(command="mystatus", description="📋 Статус заявки"),
+                BotCommand(command="admin",    description="🔧 Админ-панель"),
+            ], scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception as e:
+            logger.warning(f"Не удалось установить команды для {admin_id}: {e}")
     await bot.set_my_description(
         "🚗 Kiki Transfer — комфортный трансфер между аэропортами Бангкока "
         "(Суварнабхуми / Дон Мыанг) и Паттайей.\n\n"
